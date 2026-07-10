@@ -143,6 +143,39 @@ impl TextArea<'_> {
         self.screen_lines.borrow().len()
     }
 
+    /// Total number of on-screen (wrapped) rows the current content occupies.
+    /// With soft-wrap enabled this exceeds [`TextArea::lines`]`().len()`.
+    /// Useful as the content length when rendering an external scrollbar.
+    pub fn screen_line_count(&self) -> usize {
+        self.screen_lines_count()
+    }
+
+    /// The vertical scroll offset applied during the last render, as a top
+    /// screen-row into the wrapped content. Pair with [`TextArea::screen_line_count`]
+    /// to drive a scrollbar. Zero until the widget has been rendered once.
+    pub fn scroll_offset(&self) -> u16 {
+        self.viewport.scroll_top().0
+    }
+
+    /// Map a screen position to a data cursor `(line, column)`. `screen_row` is
+    /// an absolute wrapped-row index into the content (add [`TextArea::scroll_offset`]
+    /// to a viewport-relative click row); `screen_col` is a column within that
+    /// row. Both are clamped to valid ranges, so out-of-bounds input snaps to the
+    /// nearest cell rather than panicking.
+    pub fn cursor_at_screen(&self, screen_row: usize, screen_col: usize) -> DataCursor {
+        let count = self.screen_lines_count();
+        if count == 0 {
+            return DataCursor(0, 0);
+        }
+        let row = screen_row.min(count - 1);
+        self.screen_to_array(ScreenCursor {
+            row,
+            col: screen_col,
+            char: None,
+            dc: None,
+        })
+    }
+
     pub(crate) fn screen_line_width(&self, row: usize) -> usize {
         self.screen_lines.borrow()[row].screen_width
     }
