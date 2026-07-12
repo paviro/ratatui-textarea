@@ -124,6 +124,10 @@ pub struct TextArea<'a> {
     mask: Option<char>,
     selection_start: Option<DataCursor>,
     select_style: Style,
+    /// Optional caller-supplied base styling, one entry per data line, each a list of
+    /// `(start_byte, end_byte, style)` ranges relative to that line. Overlaid by
+    /// cursor/selection/search at render time. `None` disables syntax styling.
+    syntax_spans: Option<Vec<Vec<(usize, usize, Style)>>>,
     pub(crate) screen_lines: RefCell<Vec<ScreenLine>>,
     pub(crate) data_pointers: RefCell<Vec<DataLine>>,
     pub(crate) area: Cell<Rect>,
@@ -236,6 +240,7 @@ impl<'a> TextArea<'a> {
             mask: None,
             selection_start: None,
             select_style: Style::default().bg(Color::LightBlue),
+            syntax_spans: None,
             screen_lines: RefCell::new(Vec::new()),
             data_pointers: RefCell::new(Vec::new()),
             area: Cell::new(Rect::default()),
@@ -1475,6 +1480,24 @@ impl<'a> TextArea<'a> {
         self.select_style
     }
 
+    /// Set caller-supplied base styling for the buffer, one entry per data line, each
+    /// a list of `(start_byte, end_byte, style)` ranges relative to that line's bytes.
+    /// Ranges are rendered beneath the cursor/selection/search styling, so those keep
+    /// priority. Out-of-bounds line indices and byte offsets are ignored, and ranges
+    /// are clipped to each soft-wrapped fragment at render time, so callers can pass
+    /// whole-line ranges regardless of wrapping.
+    ///
+    /// Use this to drive e.g. markdown syntax highlighting. The caller is responsible
+    /// for keeping the spans in sync with edits (recompute and set again on change).
+    pub fn set_syntax_spans(&mut self, spans: Vec<Vec<(usize, usize, Style)>>) {
+        self.syntax_spans = Some(spans);
+    }
+
+    /// Remove any base styling set by [`TextArea::set_syntax_spans`].
+    pub fn clear_syntax_spans(&mut self) {
+        self.syntax_spans = None;
+    }
+
     fn selection_positions(&self) -> Option<(Pos, Pos)> {
         let DataCursor(sr, sc) = self.selection_start?;
         let DataCursor(er, ec) = self.cursor;
@@ -1675,13 +1698,38 @@ impl<'a> TextArea<'a> {
             }
         }
 
+        // Caller-supplied base styling (e.g. markdown syntax), clipped to this
+        // wrapped fragment the same way search matches are. Pushed before
+        // selection/cursor so those overlay it (see `Boundary` ranking).
+        if let Some(spans) = self.syntax_spans.as_ref().and_then(|s| s.get(wrapped.row)) {
+            let clipped = spans
+                .iter()
+                .filter_map(|&(start, end, style)| {
+                    let start = cmp::max(start, wrapped.start_byte);
+                    let end = cmp::min(end, wrapped.end_byte);
+                    // `then` (lazy) not `then_some` (eager): a span lying entirely
+                    // before this fragment has `end < start_byte`, and the eager
+                    // subtraction would underflow before the `start < end` guard.
+                    (start < end).then(|| {
+                        (start - wrapped.start_byte, end - wrapped.start_byte, style)
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !clipped.is_empty() {
+                hl.syntax(clipped.into_iter());
+            }
+        }
+
         #[cfg(feature = "search")]
         if let Some(matches) = self.search.matches(line) {
             let clipped = matches
                 .filter_map(|(start, end)| {
                     let start = cmp::max(start, wrapped.start_byte);
                     let end = cmp::min(end, wrapped.end_byte);
-                    (start < end).then_some((start - wrapped.start_byte, end - wrapped.start_byte))
+                    // Lazy `then`: a match entirely before this fragment has
+                    // `end < start_byte`, which would underflow if subtracted eagerly.
+                    (start < end)
+                        .then(|| (start - wrapped.start_byte, end - wrapped.start_byte))
                 })
                 .collect::<Vec<_>>();
             if !clipped.is_empty() {

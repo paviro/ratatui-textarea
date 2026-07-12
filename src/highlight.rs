@@ -2,41 +2,26 @@ use crate::util::{num_digits, spaces};
 use ratatui_core::style::Style;
 use ratatui_core::text::{Line, Span};
 use std::borrow::Cow;
-use std::cmp::Ordering;
 use unicode_width::UnicodeWidthChar as _;
 
-enum Boundary {
-    Cursor(Style),
-    Select(Style),
-    #[cfg(feature = "search")]
-    Search(Style),
-    End,
+// A styled byte range with a layering priority. The effective style of any byte is
+// the style of the highest-priority range covering it, or the line's base style
+// where no range applies. Priority — not nesting — decides overlaps, so a selection
+// that straddles a syntax range still wins across the whole selection (a LIFO stack
+// would drop the selection where the syntax range ends).
+struct StyledRange {
+    start: usize,
+    end: usize,
+    style: Style,
+    prio: u8,
 }
 
-impl Boundary {
-    fn cmp(&self, other: &Boundary) -> Ordering {
-        fn rank(b: &Boundary) -> u8 {
-            match b {
-                Boundary::Cursor(_) => 3,
-                #[cfg(feature = "search")]
-                Boundary::Search(_) => 2,
-                Boundary::Select(_) => 1,
-                Boundary::End => 0,
-            }
-        }
-        rank(self).cmp(&rank(other))
-    }
-
-    fn style(&self) -> Option<Style> {
-        match self {
-            Boundary::Cursor(s) => Some(*s),
-            Boundary::Select(s) => Some(*s),
-            #[cfg(feature = "search")]
-            Boundary::Search(s) => Some(*s),
-            Boundary::End => None,
-        }
-    }
-}
+// Higher wins. Syntax is base styling; the interactive layers overlay it.
+const PRIO_SYNTAX: u8 = 1;
+const PRIO_SELECT: u8 = 2;
+#[cfg(feature = "search")]
+const PRIO_SEARCH: u8 = 3;
+const PRIO_CURSOR: u8 = 4;
 
 struct DisplayTextBuilder {
     tab_len: u8,
@@ -92,7 +77,7 @@ impl DisplayTextBuilder {
 pub struct LineHighlighter<'a> {
     line: &'a str,
     spans: Vec<Span<'a>>,
-    boundaries: Vec<(Boundary, usize)>, // TODO: Consider smallvec
+    ranges: Vec<StyledRange>, // TODO: Consider smallvec
     style_begin: Style,
     cursor_at_end: bool,
     cursor_style: Style,
@@ -113,7 +98,7 @@ impl<'a> LineHighlighter<'a> {
         Self {
             line,
             spans: vec![],
-            boundaries: vec![],
+            ranges: vec![],
             style_begin: Style::default(),
             cursor_at_end: false,
             cursor_style,
@@ -136,9 +121,12 @@ impl<'a> LineHighlighter<'a> {
 
     pub fn cursor_line(&mut self, cursor_col: usize, style: Style) {
         if let Some((start, c)) = self.line.char_indices().nth(cursor_col) {
-            self.boundaries
-                .push((Boundary::Cursor(self.cursor_style), start));
-            self.boundaries.push((Boundary::End, start + c.len_utf8()));
+            self.ranges.push(StyledRange {
+                start,
+                end: start + c.len_utf8(),
+                style: self.cursor_style,
+                prio: PRIO_CURSOR,
+            });
         } else {
             self.cursor_at_end = true;
         }
@@ -153,8 +141,29 @@ impl<'a> LineHighlighter<'a> {
     pub fn search(&mut self, matches: impl Iterator<Item = (usize, usize)>, style: Style) {
         for (start, end) in matches {
             if start != end {
-                self.boundaries.push((Boundary::Search(style), start));
-                self.boundaries.push((Boundary::End, end));
+                self.ranges.push(StyledRange {
+                    start,
+                    end,
+                    style,
+                    prio: PRIO_SEARCH,
+                });
+            }
+        }
+    }
+
+    /// Apply caller-supplied base styling to byte ranges of the line (e.g. markdown
+    /// syntax highlighting). Ranges layer beneath cursor/selection/search. Offsets
+    /// are relative to the start of this line fragment. Ranges may straddle the
+    /// interactive layers freely; priority (not nesting) resolves overlaps.
+    pub fn syntax(&mut self, ranges: impl Iterator<Item = (usize, usize, Style)>) {
+        for (start, end, style) in ranges {
+            if start < end {
+                self.ranges.push(StyledRange {
+                    start,
+                    end,
+                    style,
+                    prio: PRIO_SYNTAX,
+                });
             }
         }
     }
@@ -183,17 +192,23 @@ impl<'a> LineHighlighter<'a> {
             return;
         };
         if start != end {
-            self.boundaries
-                .push((Boundary::Select(self.select_style), start));
-            self.boundaries.push((Boundary::End, end));
+            self.ranges.push(StyledRange {
+                start,
+                end,
+                style: self.select_style,
+                prio: PRIO_SELECT,
+            });
         }
     }
 
     pub fn selection_segment(&mut self, start_off: usize, end_off: usize, select_at_end: bool) {
         if start_off < end_off {
-            self.boundaries
-                .push((Boundary::Select(self.select_style), start_off));
-            self.boundaries.push((Boundary::End, end_off));
+            self.ranges.push(StyledRange {
+                start: start_off,
+                end: end_off,
+                style: self.select_style,
+                prio: PRIO_SELECT,
+            });
         }
         if select_at_end {
             self.select_at_end = true;
@@ -204,7 +219,7 @@ impl<'a> LineHighlighter<'a> {
         let Self {
             line,
             mut spans,
-            mut boundaries,
+            ranges,
             tab_len,
             style_begin,
             cursor_style,
@@ -215,7 +230,7 @@ impl<'a> LineHighlighter<'a> {
         } = self;
         let mut builder = DisplayTextBuilder::new(tab_len, mask);
 
-        if boundaries.is_empty() {
+        if ranges.is_empty() {
             let built = builder.build(line);
             if !built.is_empty() {
                 spans.push(Span::styled(built, style_begin));
@@ -228,31 +243,59 @@ impl<'a> LineHighlighter<'a> {
             return Line::from(spans);
         }
 
-        boundaries.sort_unstable_by(|(l, i), (r, j)| match i.cmp(j) {
-            Ordering::Equal => l.cmp(r),
-            o => o,
-        });
+        // Cut the line into segments at every range edge; within a segment the set of
+        // covering ranges is constant, so one style wins for the whole segment.
+        let mut points: Vec<usize> = Vec::with_capacity(ranges.len() * 2 + 2);
+        points.push(0);
+        points.push(line.len());
+        for r in &ranges {
+            points.push(r.start);
+            points.push(r.end);
+        }
+        points.sort_unstable();
+        points.dedup();
 
-        let mut style = style_begin;
-        let mut start = 0;
-        let mut stack = vec![];
+        // Walk segments, resolve the highest-priority covering style, and coalesce
+        // adjacent segments that resolve to the same style into one span (so the
+        // display text — and the builder's tab-width bookkeeping — stays contiguous).
+        let mut run_start = 0usize;
+        let mut run_style = style_begin;
+        let mut have_run = false;
 
-        for (next_boundary, end) in boundaries {
-            if start < end {
-                spans.push(Span::styled(builder.build(&line[start..end]), style));
+        for win in points.windows(2) {
+            let (a, b) = (win[0], win[1]);
+            if a >= b {
+                continue;
+            }
+            // Compose the covering ranges onto the base by *patching* in ascending
+            // priority (so higher layers win, but only for the fields they set). This
+            // keeps a lower layer's color where a higher layer leaves it unset — e.g.
+            // an empty cursor style (native bar cursor) doesn't blank the syntax color
+            // under it, and a selection tints syntax-colored text rather than erasing.
+            let mut style = style_begin;
+            for lvl in 1..=PRIO_CURSOR {
+                for r in &ranges {
+                    if r.prio == lvl && r.start <= a && b <= r.end {
+                        style = style.patch(r.style);
+                    }
+                }
             }
 
-            style = if let Some(s) = next_boundary.style() {
-                stack.push(style);
-                s
-            } else {
-                stack.pop().unwrap_or(style_begin)
-            };
-            start = end;
+            if have_run && style == run_style {
+                continue;
+            }
+            if have_run {
+                spans.push(Span::styled(builder.build(&line[run_start..a]), run_style));
+            }
+            run_start = a;
+            run_style = style;
+            have_run = true;
         }
-
-        if start != line.len() {
-            spans.push(Span::styled(builder.build(&line[start..]), style));
+        if have_run {
+            spans.push(Span::styled(
+                builder.build(&line[run_start..line.len()]),
+                run_style,
+            ));
         }
 
         if cursor_at_end {
@@ -459,9 +502,10 @@ mod tests {
                 ][..],
             ),
             (
+                // Adjacent same-style ranges coalesce into a single span.
                 "abcde",
                 &[(0, 2), (2, 4), (4, 5)][..],
-                &[("ab", SEARCH), ("cd", SEARCH), ("e", SEARCH)][..],
+                &[("abcde", SEARCH)][..],
             ),
             ("abcde", &[(1, 1)][..], &[("abcde", DEFAULT)][..]),
             (
@@ -476,13 +520,13 @@ mod tests {
                 ][..],
             ),
             (
+                // The adjacent (2,3),(3,4) matches coalesce; the tab still expands.
                 "\ta\tb\t",
                 &[(0, 1), (2, 3), (3, 4)][..],
                 &[
                     ("    ", SEARCH),
                     ("a", DEFAULT),
-                    ("   ", SEARCH),
-                    ("b", SEARCH),
+                    ("   b", SEARCH),
                     ("   ", DEFAULT),
                 ][..],
             ),
@@ -614,5 +658,58 @@ mod tests {
         for (what, lh, want) in tests {
             assert_spans(lh, want, what);
         }
+    }
+
+    const SYN: Style = Style::new().fg(Color::Cyan); // Syntax base style
+
+    #[test]
+    fn into_spans_syntax() {
+        // A syntax range spanning the whole line, with a plain default gap after it.
+        let mut lh = LineHighlighter::new("abcde", CUR, 4, None, SEL);
+        lh.syntax([(0usize, 3usize, SYN)].into_iter());
+        assert_spans(lh, &[("abc", SYN), ("de", DEFAULT)], "syntax only");
+    }
+
+    #[test]
+    fn into_spans_selection_over_syntax_tints_not_erases() {
+        // Selection straddles the end of a syntax range. Under priority compositing
+        // the selection's background covers the whole selection (styled text is never
+        // "skipped" as a LIFO stack would drop it), and the syntax foreground shows
+        // through where the two overlap.
+        let mut lh = LineHighlighter::new("abcde", CUR, 4, None, SEL);
+        lh.syntax([(0usize, 2usize, SYN)].into_iter()); // "ab"
+        lh.selection(0, 0, 1, 0, 4); // select "bcd"
+        let syn_sel = SYN.patch(SEL);
+        assert_spans(
+            lh,
+            &[("a", SYN), ("b", syn_sel), ("cd", SEL), ("e", DEFAULT)],
+            "selection tints syntax rather than erasing it",
+        );
+    }
+
+    #[test]
+    fn cursor_keeps_syntax_color_when_cursor_style_empty() {
+        // The editor draws a native bar cursor and sets an empty cursor style, so the
+        // char under the cursor must keep its syntax color rather than being blanked.
+        let empty = Style::new();
+        let mut lh = LineHighlighter::new("abc", empty, 4, None, SEL);
+        lh.syntax([(0usize, 3usize, SYN)].into_iter());
+        lh.cursor_line(1, empty);
+        assert_spans(lh, &[("abc", SYN)], "empty cursor keeps syntax color");
+    }
+
+    #[test]
+    fn nonempty_cursor_overlays_syntax() {
+        // A non-empty cursor style (e.g. the selection block) still overlays, but the
+        // syntax foreground survives where the cursor style leaves it unset.
+        let mut lh = LineHighlighter::new("abc", CUR, 4, None, SEL);
+        lh.syntax([(0usize, 3usize, SYN)].into_iter());
+        lh.cursor_line(1, Style::new());
+        let syn_cur = SYN.patch(CUR);
+        assert_spans(
+            lh,
+            &[("a", SYN), ("b", syn_cur), ("c", SYN)],
+            "cursor overlays but keeps syntax fg",
+        );
     }
 }
