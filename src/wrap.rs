@@ -133,7 +133,8 @@ fn wrap_word_chunks(
             seg_start = chunk.start;
         }
 
-        let chunk_width = display_width_from(chunk_text(line, chunk), seg_width, tab_len);
+        let text = chunk_text(line, chunk);
+        let chunk_width = display_width_from(text, seg_width, tab_len);
         if seg_width + chunk_width <= width {
             seg_end = chunk.end;
             seg_width += chunk_width;
@@ -142,6 +143,13 @@ fn wrap_word_chunks(
         }
 
         if seg_end > seg_start {
+            // Keep the space that overflows a wrap boundary as trailing
+            // whitespace on the current row instead of letting it lead the
+            // next one. Coverage stays contiguous for cursor mapping.
+            if is_whitespace_chunk(text) {
+                seg_end = chunk.end;
+                i += 1;
+            }
             out.push((seg_start, seg_end));
             seg_start = seg_end;
             seg_width = 0;
@@ -217,6 +225,11 @@ fn chunk_text(line: &str, chunk: Chunk) -> &str {
     &line[chunk.start..chunk.end]
 }
 
+#[inline]
+fn is_whitespace_chunk(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(char::is_whitespace)
+}
+
 fn display_width_from(text: &str, start_width: usize, tab_len: u8) -> usize {
     display_width_to(text, start_width, tab_len).saturating_sub(start_width)
 }
@@ -257,6 +270,13 @@ mod tests {
     fn word_or_glyph_wrap_splits_long_word() {
         let have = segments("helloworld", WrapMode::WordOrGlyph, 4);
         assert_eq!(have, vec!["hell", "owor", "ld"]);
+    }
+
+    #[test]
+    fn word_wrap_keeps_space_off_continuation_start() {
+        let have = segments("Hello this is a test", WrapMode::WordOrGlyph, 15);
+        assert_eq!(have, vec!["Hello this is a ", "test"]);
+        assert!(have[1..].iter().all(|s| !s.starts_with(' ')));
     }
 
     #[test]
