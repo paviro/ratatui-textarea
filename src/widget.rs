@@ -110,7 +110,8 @@ impl<'a> TextArea<'a> {
     }
 
     fn scroll_top_col(&self, prev_top: u16, width: u16) -> u16 {
-        let mut cursor = self.screen_cursor().col as u16;
+        let sc = self.screen_cursor();
+        let mut cursor = sc.col as u16;
         // Adjust the cursor position due to the width of line number.
         if self.line_number_style().is_some() {
             let lnum = num_digits(self.lines().len()) as u16 + 2; // `+ 2` for margins
@@ -119,8 +120,16 @@ impl<'a> TextArea<'a> {
             } else {
                 cursor += lnum; // The cursor position is shifted by the line number part
             };
+            return next_scroll_top(prev_top, cursor, width);
         }
-        next_scroll_top(prev_top, cursor, width)
+        let top = next_scroll_top(prev_top, cursor, width);
+        // Never scroll further right than needed to park the end-of-line caret at
+        // the right edge. `next_scroll_top` only scrolls back left once the caret
+        // moves ahead of `prev_top`, so without this the viewport stays scrolled
+        // after the text shrinks (e.g. deleting chars from the end), leaving
+        // leading text stranded off-screen and the caret past the last glyph.
+        let content_width = self.screen_line_width(sc.row) as u16;
+        top.min((content_width + 1).saturating_sub(width))
     }
 }
 

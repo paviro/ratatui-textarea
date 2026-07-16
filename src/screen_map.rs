@@ -157,6 +157,16 @@ impl TextArea<'_> {
         self.viewport.scroll_top().0
     }
 
+    /// The horizontal scroll offset (leftmost visible screen column) applied
+    /// during the last render. Only nonzero for no-wrap fields whose text
+    /// overflows the viewport; always zero when soft-wrap is enabled. Subtract
+    /// it from [`TextArea::screen_cursor`]`().col` to get the caret's
+    /// viewport-relative column (e.g. to place a native terminal cursor). Zero
+    /// until the widget has been rendered once.
+    pub fn horizontal_scroll_offset(&self) -> u16 {
+        self.viewport.scroll_top().1
+    }
+
     /// Map a screen position to a data cursor `(line, column)`. `screen_row` is
     /// an absolute wrapped-row index into the content (add [`TextArea::scroll_offset`]
     /// to a viewport-relative click row); `screen_col` is a column within that
