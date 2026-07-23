@@ -1,6 +1,7 @@
 [package]
-name = "ratatui-textarea"
+name = "notema-textarea"
 version = "0.9.2"
+publish = false
 edition = "2024"
 rust-version = "1.86.0"
 authors = ["rhysd <lin90162@yahoo.co.jp>", "The Ratatui Developers"]
@@ -9,12 +10,17 @@ ratatui-textarea is a simple yet powerful text editor widget for ratatui.
 Multi-line text editor can be easily put as part of your TUI application.
 """
 license = "MIT"
-homepage = "https://github.com/ratatui/ratatui-textarea"
-repository = "https://github.com/ratatui/ratatui-textarea"
+homepage = "https://github.com/paviro/notema-textarea"
+repository = "https://github.com/paviro/notema-textarea"
 readme = "README.md"
 categories = ["text-editors", "text-processing"]
 keywords = ["tui", "textarea", "editor", "input", "ratatui"]
 include = ["/src", "/examples", "/tests", "/README.md", "/LICENSE.txt"]
+
+# The library target keeps the upstream crate name so `ratatui_textarea::`
+# imports work unchanged for the fork's own examples/tests and for consumers.
+[lib]
+name = "ratatui_textarea"
 
 [features]
 default = ["crossterm"]

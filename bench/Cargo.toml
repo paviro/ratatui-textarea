@@ -9,7 +9,7 @@ license = "MIT"
 bench = false
 
 [dependencies]
-ratatui-textarea = { path = "..", default-features = false, features = ["search"] }
+ratatui-textarea = { package = "notema-textarea", path = "..", default-features = false, features = ["search"] }
 ratatui = { version = "0.30.1", default-features = false }
 
 [dev-dependencies]

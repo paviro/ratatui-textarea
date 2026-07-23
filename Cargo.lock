@@ -815,6 +815,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "notema-textarea"
+version = "0.9.2"
+dependencies = [
+ "arbitrary",
+ "portable-atomic",
+ "ratatui-core",
+ "ratatui-crossterm",
+ "ratatui-termion",
+ "ratatui-termwiz",
+ "ratatui-widgets",
+ "regex",
+ "serde",
+ "serde_json",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
 name = "num-conv"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1153,31 +1171,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "ratatui-textarea"
-version = "0.9.2"
-dependencies = [
- "arbitrary",
- "portable-atomic",
- "ratatui-core",
- "ratatui-crossterm",
- "ratatui-termion",
- "ratatui-termwiz",
- "ratatui-widgets",
- "regex",
- "serde",
- "serde_json",
- "unicode-segmentation",
- "unicode-width",
-]
-
-[[package]]
 name = "ratatui-textarea-bench"
 version = "0.0.0"
 dependencies = [
  "criterion",
+ "notema-textarea",
  "rand",
  "ratatui",
- "ratatui-textarea",
 ]
 
 [[package]]
