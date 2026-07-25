@@ -1526,9 +1526,11 @@ impl<'a> TextArea<'a> {
         self.viewport.set_scroll_row(next);
     }
 
-    /// The blank rows above the first line set by [`TextArea::set_top_padding`].
+    /// The blank rows above the first line, as rendered — the value passed to
+    /// [`TextArea::set_top_padding`] after the viewport cap, so it lines up with
+    /// [`TextArea::scroll_offset`].
     pub fn top_padding(&self) -> u16 {
-        self.top_padding
+        self.effective_top_padding()
     }
 
     /// The top padding actually in effect: capped at one row short of the last

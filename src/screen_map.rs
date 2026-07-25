@@ -2,6 +2,7 @@ use crate::cursor::{DataCursor, ScreenCursor};
 use crate::textarea::TextArea;
 use crate::util::num_digits;
 use crate::wrap::{WrapMode, WrappedLine, effective_wrap_width, wrapped_rows};
+use ratatui_core::layout::Rect;
 use unicode_width::UnicodeWidthChar;
 
 #[derive(Debug, Clone, Copy)]
@@ -158,6 +159,17 @@ impl TextArea<'_> {
         self.screen_lines_count()
     }
 
+    /// Wrap the buffer for `area` now. The screen map is otherwise built during
+    /// render, so a caller sizing its rect from
+    /// [`TextArea::text_screen_line_count`] would decide on the previous
+    /// render's width — or, before the first one, on unwrapped lines.
+    pub fn layout_for(&self, area: Rect) {
+        let previous = self.area.replace(area);
+        if previous.width != area.width {
+            self.screen_map_load();
+        }
+    }
+
     /// The vertical scroll offset applied during the last render, as a top
     /// screen-row into the wrapped content — counting any
     /// [`TextArea::set_top_padding`] rows, so it is 0 with the padding fully in
@@ -275,7 +287,22 @@ impl TextArea<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui_core::layout::Rect;
+
+    /// A caller sizing its rect from the wrapped-row count needs that count
+    /// before the first render, when the map still holds unwrapped lines.
+    #[test]
+    fn layout_for_wraps_before_the_first_render() {
+        let mut textarea = TextArea::from(["a ".repeat(60).trim_end()]);
+        textarea.set_wrap_mode(WrapMode::Word);
+        assert_eq!(
+            textarea.text_screen_line_count(),
+            1,
+            "unwrapped until laid out"
+        );
+
+        textarea.layout_for(Rect::new(0, 0, 20, 10));
+        assert!(textarea.text_screen_line_count() > 5);
+    }
 
     fn make_textarea(lines: &[&str], wrap_mode: WrapMode, width: u16) -> TextArea<'static> {
         let mut textarea = TextArea::from(lines.iter().copied());
