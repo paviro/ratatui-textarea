@@ -143,16 +143,26 @@ impl TextArea<'_> {
         self.screen_lines.borrow().len()
     }
 
-    /// Total number of on-screen (wrapped) rows the current content occupies.
-    /// With soft-wrap enabled this exceeds [`TextArea::lines`]`().len()`.
-    /// Useful as the content length when rendering an external scrollbar.
+    /// Total number of on-screen (wrapped) rows the current content occupies,
+    /// including any [`TextArea::set_top_padding`] rows. With soft-wrap enabled
+    /// this exceeds [`TextArea::lines`]`().len()`. Useful as the content length
+    /// when rendering an external scrollbar.
     pub fn screen_line_count(&self) -> usize {
+        self.effective_top_padding() as usize + self.screen_lines_count()
+    }
+
+    /// The wrapped-row count of the text alone, without the
+    /// [`TextArea::set_top_padding`] rows — what a caller needs to decide
+    /// whether the text fits the pane before choosing the padding.
+    pub fn text_screen_line_count(&self) -> usize {
         self.screen_lines_count()
     }
 
     /// The vertical scroll offset applied during the last render, as a top
-    /// screen-row into the wrapped content. Pair with [`TextArea::screen_line_count`]
-    /// to drive a scrollbar. Zero until the widget has been rendered once.
+    /// screen-row into the wrapped content — counting any
+    /// [`TextArea::set_top_padding`] rows, so it is 0 with the padding fully in
+    /// view. Pair with [`TextArea::screen_line_count`] to drive a scrollbar.
+    /// Zero until the widget has been rendered once.
     pub fn scroll_offset(&self) -> u16 {
         self.viewport.scroll_top().0
     }
@@ -169,15 +179,19 @@ impl TextArea<'_> {
 
     /// Map a screen position to a data cursor `(line, column)`. `screen_row` is
     /// an absolute wrapped-row index into the content (add [`TextArea::scroll_offset`]
-    /// to a viewport-relative click row); `screen_col` is a column within that
-    /// row. Both are clamped to valid ranges, so out-of-bounds input snaps to the
-    /// nearest cell rather than panicking.
+    /// to a viewport-relative click row) and counts any
+    /// [`TextArea::set_top_padding`] rows, so a position inside the padding maps
+    /// to the first line. `screen_col` is a column within that row. Both are
+    /// clamped to valid ranges, so out-of-bounds input snaps to the nearest cell
+    /// rather than panicking.
     pub fn cursor_at_screen(&self, screen_row: usize, screen_col: usize) -> DataCursor {
         let count = self.screen_lines_count();
         if count == 0 {
             return DataCursor(0, 0);
         }
-        let row = screen_row.min(count - 1);
+        let row = screen_row
+            .saturating_sub(self.effective_top_padding() as usize)
+            .min(count - 1);
         self.screen_to_array(ScreenCursor {
             row,
             col: screen_col,

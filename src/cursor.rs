@@ -434,8 +434,13 @@ impl CursorMove {
             }
             InViewport => {
                 let (row_top, col_top, row_bottom, col_bottom) = viewport.position();
+                // The viewport's rows count top padding; the cursor's do not.
+                let pad = ta.effective_top_padding() as usize;
 
-                let row = row.clamp(row_top as usize, row_bottom as usize);
+                let row = row.clamp(
+                    (row_top as usize).saturating_sub(pad),
+                    (row_bottom as usize).saturating_sub(pad),
+                );
                 let row = cmp::min(row, ta.screen_lines_count() - 1);
                 let col = col.clamp(col_top as usize, col_bottom as usize);
                 let col = cmp::min(col, ta.screen_line_max_cursor_col(row));

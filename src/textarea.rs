@@ -128,6 +128,7 @@ pub struct TextArea<'a> {
     /// `(start_byte, end_byte, style)` ranges relative to that line. Overlaid by
     /// cursor/selection/search at render time. `None` disables syntax styling.
     syntax_spans: Option<Vec<Vec<(usize, usize, Style)>>>,
+    pub(crate) top_padding: u16,
     pub(crate) screen_lines: RefCell<Vec<ScreenLine>>,
     pub(crate) data_pointers: RefCell<Vec<DataLine>>,
     pub(crate) area: Cell<Rect>,
@@ -241,6 +242,7 @@ impl<'a> TextArea<'a> {
             selection_start: None,
             select_style: Style::default().bg(Color::LightBlue),
             syntax_spans: None,
+            top_padding: 0,
             screen_lines: RefCell::new(Vec::new()),
             data_pointers: RefCell::new(Vec::new()),
             area: Cell::new(Rect::default()),
@@ -1498,6 +1500,47 @@ impl<'a> TextArea<'a> {
         self.syntax_spans = None;
     }
 
+    /// Prepend `rows` blank rows above the first line, as part of the scrollable
+    /// content rather than a viewport inset: they show at the top of the buffer
+    /// and scroll away as the cursor moves down, so no viewport height is lost.
+    ///
+    /// The padding joins the screen-row space, so [`TextArea::scroll_offset`],
+    /// [`TextArea::screen_line_count`] and [`TextArea::cursor_at_screen`] all
+    /// count it. Rendering clamps it to one row short of the viewport height, so
+    /// a line of text is always visible. Zero (the default) is a no-op.
+    pub fn set_top_padding(&mut self, rows: u16) {
+        let before = self.effective_top_padding();
+        self.top_padding = rows;
+        let after = self.effective_top_padding();
+        if after == before {
+            return;
+        }
+        // The stored scroll top counts padding rows, so rebase it onto the new
+        // padding rather than letting the document jump by the difference.
+        let top = self.viewport.scroll_top().0;
+        let next = if top <= before {
+            0
+        } else {
+            top - before + after
+        };
+        self.viewport.set_scroll_row(next);
+    }
+
+    /// The blank rows above the first line set by [`TextArea::set_top_padding`].
+    pub fn top_padding(&self) -> u16 {
+        self.top_padding
+    }
+
+    /// The top padding actually in effect: capped at one row short of the last
+    /// rendered viewport height, so padding taller than the pane still leaves a
+    /// line of text on screen. Uncapped until the first render.
+    pub(crate) fn effective_top_padding(&self) -> u16 {
+        match self.area.get().height {
+            0 => self.top_padding,
+            height => self.top_padding.min(height - 1),
+        }
+    }
+
     fn selection_positions(&self) -> Option<(Pos, Pos)> {
         let DataCursor(sr, sc) = self.selection_start?;
         let DataCursor(er, ec) = self.cursor;
@@ -1710,9 +1753,8 @@ impl<'a> TextArea<'a> {
                     // `then` (lazy) not `then_some` (eager): a span lying entirely
                     // before this fragment has `end < start_byte`, and the eager
                     // subtraction would underflow before the `start < end` guard.
-                    (start < end).then(|| {
-                        (start - wrapped.start_byte, end - wrapped.start_byte, style)
-                    })
+                    (start < end)
+                        .then(|| (start - wrapped.start_byte, end - wrapped.start_byte, style))
                 })
                 .collect::<Vec<_>>();
             if !clipped.is_empty() {
@@ -1728,8 +1770,7 @@ impl<'a> TextArea<'a> {
                     let end = cmp::min(end, wrapped.end_byte);
                     // Lazy `then`: a match entirely before this fragment has
                     // `end < start_byte`, which would underflow if subtracted eagerly.
-                    (start < end)
-                        .then(|| (start - wrapped.start_byte, end - wrapped.start_byte))
+                    (start < end).then(|| (start - wrapped.start_byte, end - wrapped.start_byte))
                 })
                 .collect::<Vec<_>>();
             if !clipped.is_empty() {

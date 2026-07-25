@@ -65,6 +65,11 @@ impl Viewport {
         self.0.store(u, Ordering::Relaxed);
     }
 
+    pub(crate) fn set_scroll_row(&mut self, row: u16) {
+        let u = self.0.get_mut();
+        *u = (*u & 0xffff_ffff_0000_0000) | ((row as u64) << 16) | (*u & 0xffff);
+    }
+
     pub fn scroll(&mut self, rows: i16, cols: i16) {
         fn apply_scroll(pos: u16, delta: i16) -> u16 {
             if delta >= 0 {
@@ -93,12 +98,19 @@ fn next_scroll_top(prev_top: u16, cursor: u16, len: u16) -> u16 {
 }
 
 impl<'a> TextArea<'a> {
+    /// `top_row` is a virtual row: the padding set by
+    /// [`TextArea::set_top_padding`] occupies rows `0..pad`, and text screen row
+    /// `r` sits at virtual row `r + pad`.
     fn text_widget(&'a self, top_row: usize, height: usize) -> Text<'a> {
+        let pad = self.effective_top_padding() as usize;
+        let blank = cmp::min(pad.saturating_sub(top_row), height);
         let lnum_len = num_digits(self.lines().len());
         let screen_lines = self.screen_lines.borrow();
-        let bottom_row = cmp::min(top_row + height, screen_lines.len());
-        let mut lines = Vec::with_capacity(bottom_row - top_row);
-        for row in &screen_lines[top_row..bottom_row] {
+        let text_top = cmp::min(top_row.saturating_sub(pad), screen_lines.len());
+        let bottom_row = cmp::min(text_top + (height - blank), screen_lines.len());
+        let mut lines = Vec::with_capacity(blank + bottom_row - text_top);
+        lines.resize(blank, Line::default());
+        for row in &screen_lines[text_top..bottom_row] {
             let line = &self.lines()[row.wrapped.row];
             lines.push(self.line_spans_segment(line, &row.wrapped, lnum_len));
         }
@@ -106,7 +118,15 @@ impl<'a> TextArea<'a> {
     }
 
     fn scroll_top_row(&self, prev_top: u16, height: u16) -> u16 {
-        next_scroll_top(prev_top, self.screen_cursor().row as u16, height)
+        let pad = self.effective_top_padding();
+        let next = next_scroll_top(prev_top, self.screen_cursor().row as u16 + pad, height);
+        // A pull-back landing inside the padding means the caret reached the
+        // first line; show the padding whole instead of a slice of it.
+        if next < prev_top && next <= pad {
+            0
+        } else {
+            next
+        }
     }
 
     fn scroll_top_col(&self, prev_top: u16, width: u16) -> u16 {
@@ -143,8 +163,13 @@ impl Widget for &TextArea<'_> {
         let Rect { width, height, .. } = inner_area;
 
         if self.area.get() != inner_area {
+            // Only the width feeds the wrap, so a height-only change (e.g. a
+            // caller centering the rect) must not rebuild the screen map.
+            let rewrap = self.area.get().width != inner_area.width;
             self.area.set(inner_area);
-            self.screen_map_load();
+            if rewrap {
+                self.screen_map_load();
+            }
         }
 
         let (prev_top_row, prev_top_col) = self.viewport.scroll_top();
@@ -156,6 +181,12 @@ impl Widget for &TextArea<'_> {
             } else {
                 placeholder.lines.push(Line::from(vec![cursor]));
             }
+            // Pad the placeholder too, so the first keystroke doesn't shift the
+            // text up by the padding.
+            let pad = self.effective_top_padding() as usize;
+            placeholder
+                .lines
+                .splice(0..0, std::iter::repeat_n(Line::default(), pad));
             (placeholder, 0u16, 0u16)
         } else {
             let top_row = self.scroll_top_row(prev_top_row, height);
@@ -194,6 +225,7 @@ impl Widget for &TextArea<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{CursorMove, DataCursor};
 
     #[test]
     fn viewport_store_and_load() {
@@ -210,5 +242,106 @@ mod tests {
         vp.store(5, 2, 40, 10);
         let vp2 = vp.clone();
         assert_eq!(vp2.scroll_top(), (5, 2));
+    }
+
+    /// Render `textarea` into an 8x`height` buffer and return each row's text,
+    /// trailing blanks trimmed — so a padding row reads as an empty string.
+    fn render_rows(textarea: &TextArea<'_>, height: u16) -> Vec<String> {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height,
+        };
+        let mut buf = Buffer::empty(area);
+        textarea.render(area, &mut buf);
+        (0..height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn numbered(count: usize) -> TextArea<'static> {
+        (0..count).map(|i| i.to_string()).collect()
+    }
+
+    #[test]
+    fn top_padding_shows_blank_rows_then_scrolls_away() {
+        let mut textarea = numbered(20);
+        textarea.set_top_padding(3);
+        assert_eq!(render_rows(&textarea, 6), ["", "", "", "0", "1", "2"]);
+        // Past the padding the rows are text only, and the padding is gone.
+        textarea.scroll((5, 0));
+        assert_eq!(render_rows(&textarea, 6), ["2", "3", "4", "5", "6", "7"]);
+        assert_eq!(textarea.scroll_offset(), 5);
+    }
+
+    #[test]
+    fn top_padding_returns_when_the_caret_reaches_the_first_line() {
+        let mut textarea = numbered(20);
+        textarea.set_top_padding(3);
+        render_rows(&textarea, 6);
+        textarea.move_cursor(CursorMove::Bottom);
+        render_rows(&textarea, 6);
+        assert!(textarea.scroll_offset() > 3);
+        textarea.move_cursor(CursorMove::Top);
+        assert_eq!(render_rows(&textarea, 6), ["", "", "", "0", "1", "2"]);
+        assert_eq!(textarea.scroll_offset(), 0);
+    }
+
+    /// A wheel scroll inside the padding must stick — only a caret pull-back
+    /// snaps the padding back into view.
+    #[test]
+    fn top_padding_keeps_a_partial_scroll() {
+        let mut textarea = numbered(20);
+        textarea.set_top_padding(3);
+        render_rows(&textarea, 6);
+        textarea.scroll((1, 0));
+        assert_eq!(render_rows(&textarea, 6), ["", "", "0", "1", "2", "3"]);
+    }
+
+    #[test]
+    fn top_padding_is_capped_below_the_viewport_height() {
+        let mut textarea = numbered(20);
+        textarea.set_top_padding(50);
+        assert_eq!(render_rows(&textarea, 4), ["", "", "", "0"]);
+        assert_eq!(textarea.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn top_padding_counts_toward_the_scroll_geometry() {
+        let mut textarea = numbered(20);
+        textarea.set_top_padding(3);
+        render_rows(&textarea, 6);
+        assert_eq!(textarea.screen_line_count(), 23);
+        assert_eq!(textarea.text_screen_line_count(), 20);
+        // A click in the padding lands on the first line, not below it.
+        assert_eq!(textarea.cursor_at_screen(1, 0), DataCursor(0, 0));
+        assert_eq!(textarea.cursor_at_screen(4, 0), DataCursor(1, 0));
+    }
+
+    /// Changing the padding must not drag the document with it.
+    #[test]
+    fn set_top_padding_rebases_the_scroll() {
+        let mut textarea = numbered(20);
+        textarea.set_top_padding(3);
+        render_rows(&textarea, 6);
+        textarea.scroll((7, 0));
+        assert_eq!(render_rows(&textarea, 6), ["4", "5", "6", "7", "8", "9"]);
+        textarea.set_top_padding(0);
+        assert_eq!(render_rows(&textarea, 6), ["4", "5", "6", "7", "8", "9"]);
+    }
+
+    #[test]
+    fn top_padding_offsets_the_placeholder() {
+        let mut textarea = TextArea::default();
+        textarea.set_placeholder_text("Write…");
+        textarea.set_top_padding(2);
+        assert_eq!(render_rows(&textarea, 4), ["", "", " Write…", ""]);
     }
 }
