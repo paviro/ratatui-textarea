@@ -128,6 +128,10 @@ pub struct TextArea<'a> {
     /// `(start_byte, end_byte, style)` ranges relative to that line. Overlaid by
     /// cursor/selection/search at render time. `None` disables syntax styling.
     syntax_spans: Option<Vec<Vec<(usize, usize, Style)>>>,
+    /// Optional display-only glyph substitutions, one entry per data line, each a
+    /// list of `(byte_offset, replacement)`. Width-preserving, so the screen map —
+    /// which measures the buffer text — stays authoritative. `None` disables them.
+    glyph_subs: Option<Vec<Vec<(usize, char)>>>,
     pub(crate) top_padding: u16,
     pub(crate) screen_lines: RefCell<Vec<ScreenLine>>,
     pub(crate) data_pointers: RefCell<Vec<DataLine>>,
@@ -242,6 +246,7 @@ impl<'a> TextArea<'a> {
             selection_start: None,
             select_style: Style::default().bg(Color::LightBlue),
             syntax_spans: None,
+            glyph_subs: None,
             top_padding: 0,
             screen_lines: RefCell::new(Vec::new()),
             data_pointers: RefCell::new(Vec::new()),
@@ -1500,6 +1505,36 @@ impl<'a> TextArea<'a> {
         self.syntax_spans = None;
     }
 
+    /// Render single chars as different chars of the *same display width*, one
+    /// entry per data line, each a list of `(byte_offset, replacement)` relative
+    /// to that line's bytes. Use it to draw a delimiter as a bracket or a blank
+    /// without changing what the buffer holds.
+    ///
+    /// Display only. The buffer text is untouched, so [`TextArea::lines`], the
+    /// clipboard, search and every column calculation still see the real chars —
+    /// which is also why what the user sees can differ from what a search matches.
+    /// Style the same bytes through [`TextArea::set_syntax_spans`] if the cell
+    /// should look different too; the two compose.
+    ///
+    /// Entries are silently ignored when the line index is out of range, the
+    /// offset is past the end of the line or not a char boundary, the
+    /// replacement's display width differs from the replaced char's, or either
+    /// char has no defined width (control chars, and `\t`, whose width depends on
+    /// the column). A mask suppresses them entirely. Offsets are per `char`, not
+    /// per grapheme cluster: substituting a base char leaves its combining marks
+    /// to compose onto the replacement. Where two entries share an offset, the
+    /// first wins.
+    ///
+    /// The caller keeps the offsets in sync with edits (recompute and set again).
+    pub fn set_glyph_substitutions(&mut self, subs: Vec<Vec<(usize, char)>>) {
+        self.glyph_subs = Some(subs);
+    }
+
+    /// Remove any substitutions set by [`TextArea::set_glyph_substitutions`].
+    pub fn clear_glyph_substitutions(&mut self) {
+        self.glyph_subs = None;
+    }
+
     /// Prepend `rows` blank rows above the first line, as part of the scrollable
     /// content rather than a viewport inset: they show at the top of the buffer
     /// and scroll away as the cursor moves down, so no viewport height is lost.
@@ -1761,6 +1796,20 @@ impl<'a> TextArea<'a> {
                 .collect::<Vec<_>>();
             if !clipped.is_empty() {
                 hl.syntax(clipped.into_iter());
+            }
+        }
+
+        // Display-only glyph substitutions, rebased onto this fragment. A wrap
+        // never cuts a char, so an offset is either wholly inside the fragment or
+        // outside it; the highlighter validates boundary and width regardless.
+        if let Some(subs) = self.glyph_subs.as_ref().and_then(|s| s.get(wrapped.row)) {
+            let clipped = subs
+                .iter()
+                .filter(|&&(offset, _)| wrapped.start_byte <= offset && offset < wrapped.end_byte)
+                .map(|&(offset, replacement)| (offset - wrapped.start_byte, replacement))
+                .collect::<Vec<_>>();
+            if !clipped.is_empty() {
+                hl.glyph_substitutions(clipped.into_iter());
             }
         }
 

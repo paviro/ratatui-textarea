@@ -23,22 +23,64 @@ const PRIO_SELECT: u8 = 2;
 const PRIO_SEARCH: u8 = 3;
 const PRIO_CURSOR: u8 = 4;
 
+// A substitution is only legal when it swaps one char for another of the same
+// display width: the screen map measures the *buffer* text, so anything else
+// would leave the caret, click mapping, selection and horizontal scroll
+// disagreeing with what is on screen. Chars with no defined width — every
+// control char, and `\t`, whose width depends on the column — never compare
+// equal, which is how they are excluded without being named.
+fn valid_substitution(line: &str, offset: usize, replacement: char) -> bool {
+    if !line.is_char_boundary(offset) {
+        return false;
+    }
+    let Some(replaced) = line[offset..].chars().next() else {
+        return false; // A boundary, but at the end: nothing there to replace.
+    };
+    matches!(
+        (replaced.width(), replacement.width()),
+        (Some(a), Some(b)) if a == b
+    )
+}
+
 struct DisplayTextBuilder {
     tab_len: u8,
     width: usize,
     mask: Option<char>,
+    // Validated (byte offset in the line, replacement), sorted by offset.
+    subs: Vec<(usize, char)>,
+    // Cursor into `subs`. Runs are built in ascending, contiguous byte order, so
+    // one forward-only cursor covers the whole line.
+    next_sub: usize,
 }
 
 impl DisplayTextBuilder {
-    fn new(tab_len: u8, mask: Option<char>) -> Self {
+    fn new(tab_len: u8, mask: Option<char>, subs: Vec<(usize, char)>) -> Self {
         Self {
             tab_len,
             width: 0,
             mask,
+            subs,
+            next_sub: 0,
         }
     }
 
-    fn build<'s>(&mut self, s: &'s str) -> Cow<'s, str> {
+    // The replacement for the char at `offset`, if there is one.
+    fn substitution_at(&mut self, offset: usize) -> Option<char> {
+        while self
+            .subs
+            .get(self.next_sub)
+            .is_some_and(|&(at, _)| at < offset)
+        {
+            self.next_sub += 1;
+        }
+        match self.subs.get(self.next_sub) {
+            Some(&(at, replacement)) if at == offset => Some(replacement),
+            _ => None,
+        }
+    }
+
+    // `s` is the slice of the line starting at byte `start`.
+    fn build<'s>(&mut self, start: usize, s: &'s str) -> Cow<'s, str> {
         if let Some(ch) = self.mask {
             // Note: We don't need to track width on masking text since width of tab character is fixed
             let masked = std::iter::repeat_n(ch, s.chars().count()).collect();
@@ -58,6 +100,16 @@ impl DisplayTextBuilder {
                     buf.push_str(&tab[..len]);
                     self.width += len;
                 }
+            } else if let Some(replacement) = self.substitution_at(start + i) {
+                if buf.is_empty() {
+                    buf.reserve(s.len());
+                    buf.push_str(&s[..i]);
+                }
+                buf.push(replacement);
+                // Advance by the *replaced* char's width. Validation makes the two
+                // equal; taking it from the source keeps tab stops right even if a
+                // bad entry ever reaches here.
+                self.width += c.width().unwrap_or(0);
             } else {
                 if !buf.is_empty() {
                     buf.push(c);
@@ -85,6 +137,7 @@ pub struct LineHighlighter<'a> {
     mask: Option<char>,
     select_at_end: bool,
     select_style: Style,
+    subs: Vec<(usize, char)>,
 }
 
 impl<'a> LineHighlighter<'a> {
@@ -106,6 +159,7 @@ impl<'a> LineHighlighter<'a> {
             mask,
             select_at_end: false,
             select_style,
+            subs: vec![],
         }
     }
 
@@ -176,6 +230,33 @@ impl<'a> LineHighlighter<'a> {
         }
     }
 
+    /// Render single chars of the line as different chars of the *same display
+    /// width* — a delimiter drawn as a bracket or a blank, say. Offsets are
+    /// relative to the start of this line fragment.
+    ///
+    /// This is display only: the buffer text is untouched, so the screen map,
+    /// caret, click mapping, selection and horizontal scroll all keep measuring
+    /// what is really there. Style the same bytes through [`Self::syntax`] if the
+    /// cell should also look different.
+    ///
+    /// Entries are silently dropped when the offset is not a char boundary inside
+    /// the fragment, or the widths differ (see [`valid_substitution`]). A mask
+    /// suppresses them entirely: masking exists to hide content, and a
+    /// distinguishable glyph at a known offset would leak its shape.
+    pub fn glyph_substitutions(&mut self, subs: impl Iterator<Item = (usize, char)>) {
+        if self.mask.is_some() {
+            return;
+        }
+        self.subs.extend(
+            subs.filter(|&(offset, replacement)| {
+                valid_substitution(self.line, offset, replacement)
+            }),
+        );
+        self.subs.sort_by_key(|&(offset, _)| offset);
+        // Stable sort plus `dedup_by_key` keeps the first entry for an offset.
+        self.subs.dedup_by_key(|&mut (offset, _)| offset);
+    }
+
     pub fn selection(
         &mut self,
         current_row: usize,
@@ -235,11 +316,12 @@ impl<'a> LineHighlighter<'a> {
             mask,
             select_at_end,
             select_style,
+            subs,
         } = self;
-        let mut builder = DisplayTextBuilder::new(tab_len, mask);
+        let mut builder = DisplayTextBuilder::new(tab_len, mask, subs);
 
         if ranges.is_empty() {
-            let built = builder.build(line);
+            let built = builder.build(0, line);
             if !built.is_empty() {
                 spans.push(Span::styled(built, style_begin));
             }
@@ -293,7 +375,10 @@ impl<'a> LineHighlighter<'a> {
                 continue;
             }
             if have_run {
-                spans.push(Span::styled(builder.build(&line[run_start..a]), run_style));
+                spans.push(Span::styled(
+                    builder.build(run_start, &line[run_start..a]),
+                    run_style,
+                ));
             }
             run_start = a;
             run_style = style;
@@ -301,7 +386,7 @@ impl<'a> LineHighlighter<'a> {
         }
         if have_run {
             spans.push(Span::styled(
-                builder.build(&line[run_start..line.len()]),
+                builder.build(run_start, &line[run_start..line.len()]),
                 run_style,
             ));
         }
@@ -325,14 +410,14 @@ mod tests {
     use unicode_width::UnicodeWidthStr as _;
 
     fn build(text: &'static str, tab: u8, mask: Option<char>) -> Cow<'static, str> {
-        DisplayTextBuilder::new(tab, mask).build(text)
+        DisplayTextBuilder::new(tab, mask, vec![]).build(0, text)
     }
 
     #[track_caller]
     fn build_with_offset(offset: usize, text: &'static str, tab: u8) -> Cow<'static, str> {
-        let mut b = DisplayTextBuilder::new(tab, None);
+        let mut b = DisplayTextBuilder::new(tab, None, vec![]);
         b.width = offset;
-        let built = b.build(text);
+        let built = b.build(0, text);
         let want = offset + built.as_ref().width();
         assert_eq!(b.width, want, "in={:?}, out={:?}", text, built); // Check post condition
         built
@@ -725,16 +810,115 @@ mod tests {
     fn syntax_drops_a_range_that_would_split_a_char() {
         // `into_spans` slices the raw line at range edges, so an offset inside a
         // multi-byte char would panic mid-render rather than misdraw.
-        let mut lh = LineHighlighter::new("\u{3042}\u{3044}", CUR, 4, None, SEL);
+        let mut lh = LineHighlighter::new("あい", CUR, 4, None, SEL);
         lh.syntax([(1usize, 3usize, SYN), (0usize, 20usize, SYN)].into_iter());
-        assert_spans(lh, &[("\u{3042}\u{3044}", DEFAULT)], "both ranges rejected");
+        assert_spans(lh, &[("あい", DEFAULT)], "both ranges rejected");
         // The well-formed range on the same text still applies.
-        let mut lh = LineHighlighter::new("\u{3042}\u{3044}", CUR, 4, None, SEL);
+        let mut lh = LineHighlighter::new("あい", CUR, 4, None, SEL);
         lh.syntax([(0usize, 3usize, SYN)].into_iter());
+        assert_spans(lh, &[("あ", SYN), ("い", DEFAULT)], "boundary range kept");
+    }
+
+    #[test]
+    fn glyph_substitution_replaces_single_chars() {
+        let mut lh = LineHighlighter::new("\"a\"", CUR, 4, None, SEL);
+        lh.glyph_substitutions([(0usize, '['), (2usize, ']')].into_iter());
+        assert_spans(lh, &[("[a]", DEFAULT)], "quotes drawn as brackets");
+    }
+
+    /// Adjacent segments resolving to one style are coalesced into a single run,
+    /// which is the *common* case here: a pill styles the delimiters and the value
+    /// alike. Substituting inside the display builder rather than as its own span
+    /// is what keeps that harmless.
+    #[test]
+    fn glyph_substitution_survives_run_coalescing() {
+        let mut lh = LineHighlighter::new("\"apple\"", CUR, 4, None, SEL);
+        lh.syntax([(0usize, 7usize, SYN)].into_iter());
+        lh.glyph_substitutions([(0usize, ' '), (6usize, ' ')].into_iter());
+        assert_spans(lh, &[(" apple ", SYN)], "one styled run, quotes blanked");
+    }
+
+    /// Offsets are line-relative while runs are built from slices, so the builder
+    /// has to be told where each run starts. A hardcoded zero substitutes the
+    /// wrong chars, and only a run boundary shows it.
+    #[test]
+    fn glyph_substitution_is_offset_by_the_run_start() {
+        let mut lh = LineHighlighter::new("ab\"cd\"", CUR, 4, None, SEL);
+        lh.syntax([(0usize, 2usize, SYN)].into_iter());
+        lh.glyph_substitutions([(2usize, '['), (5usize, ']')].into_iter());
+        assert_spans(lh, &[("ab", SYN), ("[cd]", DEFAULT)], "second run offset");
+    }
+
+    #[test]
+    fn glyph_substitution_keeps_multibyte_widths() {
+        // Wide for wide is fine; the buffer offsets shift but the columns don't.
+        let mut lh = LineHighlighter::new("あい", CUR, 4, None, SEL);
+        lh.glyph_substitutions([(0usize, '＊')].into_iter());
+        assert_spans(lh, &[("＊い", DEFAULT)], "wide for wide");
+        // Narrow for wide and wide for narrow both change the column count, which
+        // would desync the screen map from the render.
+        let mut lh = LineHighlighter::new("あb", CUR, 4, None, SEL);
+        lh.glyph_substitutions([(0usize, 'x'), (3usize, 'あ')].into_iter());
+        assert_spans(lh, &[("あb", DEFAULT)], "width mismatches dropped");
+    }
+
+    #[test]
+    fn glyph_substitution_ignores_unusable_offsets() {
+        let mut lh = LineHighlighter::new("あい", CUR, 4, None, SEL);
+        lh.glyph_substitutions(
+            [
+                (1usize, 'x'),     // inside a char
+                (6usize, 'x'),     // at the end: nothing to replace
+                (99usize, 'x'),    // past the end
+                (usize::MAX, 'x'), // and nowhere near it
+            ]
+            .into_iter(),
+        );
+        assert_spans(lh, &[("あい", DEFAULT)], "stale offsets are inert");
+    }
+
+    #[test]
+    fn glyph_substitution_rejects_chars_with_no_width() {
+        // A tab's width depends on the column it lands in, so it is neither a
+        // legal source nor a legal replacement.
+        let mut lh = LineHighlighter::new("a\tb", CUR, 4, None, SEL);
+        lh.glyph_substitutions([(1usize, ' '), (0usize, '\u{7}')].into_iter());
+        assert_spans(lh, &[("a   b", DEFAULT)], "tab expands, nothing replaced");
+    }
+
+    /// The substituted char still has to advance the builder's column count, or
+    /// every tab further along the line lands in the wrong place.
+    #[test]
+    fn glyph_substitution_keeps_tab_stops() {
+        let mut lh = LineHighlighter::new("\"a\"\tb", CUR, 4, None, SEL);
+        lh.glyph_substitutions([(0usize, '['), (2usize, ']')].into_iter());
+        // Three columns used, so the tab pads exactly one to the next stop.
+        assert_spans(lh, &[("[a] b", DEFAULT)], "tab stop unmoved");
+    }
+
+    #[test]
+    fn glyph_substitution_is_suppressed_by_a_mask() {
+        let mut lh = LineHighlighter::new("\"a\"", CUR, 4, Some('x'), SEL);
+        lh.glyph_substitutions([(0usize, '['), (2usize, ']')].into_iter());
+        assert_spans(lh, &[("xxx", DEFAULT)], "a mask hides the shape too");
+    }
+
+    #[test]
+    fn glyph_substitution_keeps_the_first_of_two_at_one_offset() {
+        let mut lh = LineHighlighter::new("\"a\"", CUR, 4, None, SEL);
+        lh.glyph_substitutions([(0usize, '['), (0usize, '<')].into_iter());
+        assert_spans(lh, &[("[a\"", DEFAULT)], "first entry wins");
+    }
+
+    #[test]
+    fn glyph_substitution_composes_with_the_cursor() {
+        let mut lh = LineHighlighter::new("\"a\"", CUR, 4, None, SEL);
+        lh.glyph_substitutions([(0usize, '[')].into_iter());
+        lh.cursor_line(0, LINE);
         assert_spans(
             lh,
-            &[("\u{3042}", SYN), ("\u{3044}", DEFAULT)],
-            "boundary range kept",
+            &[("[", CUR), ("a\"", LINE)],
+            "the replacement carries the cursor style",
         );
     }
 }
