@@ -155,9 +155,17 @@ impl<'a> LineHighlighter<'a> {
     /// syntax highlighting). Ranges layer beneath cursor/selection/search. Offsets
     /// are relative to the start of this line fragment. Ranges may straddle the
     /// interactive layers freely; priority (not nesting) resolves overlaps.
+    ///
+    /// A range is dropped unless both edges are char boundaries within the line:
+    /// `into_spans` slices the raw line at them, and a slice through the middle of
+    /// a multi-byte char panics mid-render.
     pub fn syntax(&mut self, ranges: impl Iterator<Item = (usize, usize, Style)>) {
         for (start, end, style) in ranges {
-            if start < end {
+            if start < end
+                && self.line.is_char_boundary(start)
+                && self.line.is_char_boundary(end)
+                && end <= self.line.len()
+            {
                 self.ranges.push(StyledRange {
                     start,
                     end,
@@ -710,6 +718,23 @@ mod tests {
             lh,
             &[("a", SYN), ("b", syn_cur), ("c", SYN)],
             "cursor overlays but keeps syntax fg",
+        );
+    }
+
+    #[test]
+    fn syntax_drops_a_range_that_would_split_a_char() {
+        // `into_spans` slices the raw line at range edges, so an offset inside a
+        // multi-byte char would panic mid-render rather than misdraw.
+        let mut lh = LineHighlighter::new("\u{3042}\u{3044}", CUR, 4, None, SEL);
+        lh.syntax([(1usize, 3usize, SYN), (0usize, 20usize, SYN)].into_iter());
+        assert_spans(lh, &[("\u{3042}\u{3044}", DEFAULT)], "both ranges rejected");
+        // The well-formed range on the same text still applies.
+        let mut lh = LineHighlighter::new("\u{3042}\u{3044}", CUR, 4, None, SEL);
+        lh.syntax([(0usize, 3usize, SYN)].into_iter());
+        assert_spans(
+            lh,
+            &[("\u{3042}", SYN), ("\u{3044}", DEFAULT)],
+            "boundary range kept",
         );
     }
 }
